@@ -9,6 +9,8 @@ from .discover import COMMANDS as _DISCOVER
 from .attack import COMMANDS as _ATTACK
 from .protocol import COMMANDS as _PROTOCOL
 from .mcp_specific import COMMANDS as _MCP
+from .module7 import COMMANDS as _M7
+from .a2a import COMMANDS as _A2A
 from .output import COMMANDS as _OUTPUT
 from .session import COMMANDS as _SESSION
 
@@ -20,6 +22,8 @@ COMMANDS: dict = {
     **_ATTACK,
     **_PROTOCOL,
     **_MCP,
+    **_M7,
+    **_A2A,
     **_OUTPUT,
     **_SESSION,
 }

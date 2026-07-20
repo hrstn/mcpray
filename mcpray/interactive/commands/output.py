@@ -78,9 +78,40 @@ async def cmd_poc(state: "REPLState", args: list[str], console: Console) -> None
         console.print("[yellow]No qualifying findings for PoC generation.[/]")
 
 
+# ─── bundle ───────────────────────────────────────────────────────────────────
+
+async def cmd_bundle(state: "REPLState", args: list[str], console: Console) -> None:
+    """Write an ATLAS-tagged Markdown report bundle (findings + verbatim wire log).
+
+    Usage:
+      bundle
+      bundle report.md
+      bundle --output ./out/mcp_report.md
+    """
+    from ...reporters import bundle_reporter
+
+    if not state.require_scan():
+        console.print("[yellow]Run: scan[/]")
+        return
+
+    out = "mcpray_report.md"
+    for i, a in enumerate(args):
+        if a in ("--output", "-o") and i + 1 < len(args):
+            out = args[i + 1]
+            break
+    else:
+        if args and not args[0].startswith("-"):
+            out = args[0]
+
+    bundle_reporter.write(state.scan_result, out)
+    wl = len(getattr(state.scan_result, "wire_log", []) or [])
+    console.print(f"[green]✓[/] Report bundle → {out}  [dim]({wl} wire-log entries)[/]")
+
+
 # ─── Command registry ─────────────────────────────────────────────────────────
 
 COMMANDS: dict[str, tuple] = {
     "nuclei": (cmd_nuclei, "Generate Nuclei templates from scan results"),
     "poc":    (cmd_poc,    "Generate PoC exploit scripts from scan results"),
+    "bundle": (cmd_bundle, "Write ATLAS-tagged report bundle + verbatim wire log"),
 }

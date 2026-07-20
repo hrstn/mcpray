@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any, Literal
 
@@ -25,7 +26,7 @@ from .logger import log_ai_request, log_ai_response
 
 _log = logging.getLogger("mcpray.ai.client")
 
-AIMode = Literal["openai", "ollama", "hybrid"]
+AIMode = Literal["openai", "ollama", "hybrid", "anthropic"]
 
 
 class AIError(Exception):
@@ -43,6 +44,9 @@ class AIClient:
         openai_model: str = "gpt-4o-mini",
         ollama_base_url: str = "http://localhost:11434",
         ollama_model: str = "llama3.2",
+        anthropic_api_key: str | None = None,
+        anthropic_base_url: str = "https://api.anthropic.com",
+        anthropic_model: str = "claude-opus-4-8",
         timeout: int = 90,
         hybrid_openai_weight: float = 0.6,
     ):
@@ -52,6 +56,9 @@ class AIClient:
         self.openai_model = openai_model
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.ollama_model = ollama_model
+        self.anthropic_api_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.anthropic_base_url = anthropic_base_url.rstrip("/")
+        self.anthropic_model = anthropic_model
         self.timeout = timeout
         self._hybrid_weight = hybrid_openai_weight  # OpenAI weight in consensus
 
@@ -76,9 +83,65 @@ class AIClient:
             return await self._openai_call(function_name, payload)
         if self.mode == "ollama":
             return await self._ollama_call(function_name, payload)
+        if self.mode == "anthropic":
+            return await self._anthropic_call(function_name, payload)
         if self.mode == "hybrid":
             return await self._hybrid_call(function_name, payload)
         raise AIError(f"Unknown AI mode: {self.mode!r}")
+
+    # ─── Anthropic (Claude) — raw Messages API, matching the httpx pattern ────
+
+    async def _anthropic_call(self, function_name: str, payload: dict) -> dict:
+        if not self.anthropic_api_key:
+            raise AIError("Anthropic API key not configured (set ANTHROPIC_API_KEY or pass --ai-key)")
+
+        system_prompt = get_system_prompt(function_name)
+        user_message = payload.get("prompt", "")
+        # NOTE: no `temperature` — current Claude models reject it (400).
+        body: dict[str, Any] = {
+            "model": self.anthropic_model,
+            "max_tokens": 1024,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_message}],
+        }
+
+        model_label = f"{self.anthropic_model}@anthropic"
+        log_ai_request(function_name, model_label,
+                       finding_id=getattr(payload.get("finding"), "id", None))
+        t0 = time.monotonic()
+
+        async with httpx.AsyncClient(timeout=self.timeout) as http:
+            try:
+                resp = await http.post(
+                    f"{self.anthropic_base_url}/v1/messages",
+                    headers={
+                        "x-api-key": self.anthropic_api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json=body,
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                raise AIError(f"Anthropic API error {e.response.status_code}: {e.response.text[:300]}") from e
+            except httpx.RequestError as e:
+                raise AIError(f"Anthropic connection error: {e}") from e
+
+        elapsed = int((time.monotonic() - t0) * 1000)
+        data = resp.json()
+        if data.get("stop_reason") == "refusal":
+            raise AIError("Anthropic declined the request (stop_reason=refusal)")
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        result = self._extract_json(text, function_name)
+
+        log_ai_response(
+            function_name, model_label, elapsed,
+            confidence=result.get("confidence"),
+            finding_id=getattr(payload.get("finding"), "id", None),
+        )
+        result["_provider"] = "anthropic"
+        result["_model"] = self.anthropic_model
+        return result
 
     # ─── OpenAI / OpenAI-compatible ─────────────────────────────────────────
 
@@ -319,5 +382,19 @@ class AIClient:
                     status["ollama"] = r.status_code == 200
             except Exception:
                 status["ollama"] = False
+
+        if self.mode == "anthropic":
+            try:
+                async with httpx.AsyncClient(timeout=5) as http:
+                    if self.anthropic_api_key:
+                        r = await http.get(
+                            f"{self.anthropic_base_url}/v1/models",
+                            headers={"x-api-key": self.anthropic_api_key, "anthropic-version": "2023-06-01"},
+                        )
+                        status["anthropic"] = r.status_code == 200
+                    else:
+                        status["anthropic"] = False
+            except Exception:
+                status["anthropic"] = False
 
         return status

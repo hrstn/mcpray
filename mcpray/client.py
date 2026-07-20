@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -74,6 +77,26 @@ class MCPClient:
         self._client: Client | None = None
         self.auth_required: bool = False
         self.transport: str = self._detect_transport(target)
+        # Verbatim log of every MCP operation (request params + full response),
+        # for report-bundle evidence ("include all your queries as text").
+        self.wire_log: list[dict] = []
+
+    def _log_wire(
+        self, op: str, target: str, params: dict, ok: bool,
+        response: Any = None, error: str | None = None, latency_ms: int | None = None,
+    ) -> None:
+        if isinstance(response, str) or response is None:
+            resp = response or ""
+        else:
+            try:
+                resp = json.dumps(response, default=str)
+            except Exception:
+                resp = str(response)
+        self.wire_log.append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "op": op, "target": target, "params": params, "ok": ok,
+            "response": resp, "error": error, "latency_ms": latency_ms,
+        })
 
     @staticmethod
     def _detect_transport(target: str) -> str:
@@ -115,6 +138,12 @@ class MCPClient:
         resource_templates = await self._safe_list_resource_templates()
         prompts = await self._safe_list_prompts()
 
+        self._log_wire(
+            "enumerate", self.target,
+            {"lists": ["tools", "resources", "resource_templates", "prompts"]}, True,
+            {"tools": len(tools), "resources": len(resources),
+             "resource_templates": len(resource_templates), "prompts": len(prompts)},
+        )
         return ServerInventory(
             target=self.target,
             transport=self.transport,
@@ -193,16 +222,41 @@ class MCPClient:
             logger.warning("list_prompts failed: %s", e)
             return []
 
+    def protocol_info(self) -> dict:
+        """Best-effort negotiated protocol + server + fastmcp version (post-connect)."""
+        import importlib.metadata as _md
+        info: dict = {"fastmcp_version": None, "protocol_version": None,
+                      "server_name": None, "server_version": None}
+        try:
+            info["fastmcp_version"] = _md.version("fastmcp")
+        except Exception:
+            pass
+        ir = getattr(self._client, "initialize_result", None)
+        if ir is not None:
+            info["protocol_version"] = getattr(ir, "protocolVersion", None) or getattr(ir, "protocol_version", None)
+            si = getattr(ir, "serverInfo", None) or getattr(ir, "server_info", None)
+            if si is not None:
+                info["server_name"] = getattr(si, "name", None)
+                info["server_version"] = getattr(si, "version", None)
+        return info
+
     async def read_resource(self, uri: str) -> str | None:  # noqa: D102
+        start = time.monotonic()
         try:
             result = await self._client.read_resource(uri)
-            return _extract_resource_text(result)
+            text = _extract_resource_text(result)
+            self._log_wire("read_resource", uri, {"uri": uri}, True, text,
+                           latency_ms=int((time.monotonic() - start) * 1000))
+            return text
         except Exception as e:
+            self._log_wire("read_resource", uri, {"uri": uri}, False, error=str(e),
+                           latency_ms=int((time.monotonic() - start) * 1000))
             logger.debug("read_resource(%s) failed: %s", uri, e)
             return None
 
     async def call_tool(self, name: str, arguments: dict) -> dict:
         """Call a tool and return normalized result. Only used during active testing."""
+        start = time.monotonic()
         try:
             result = await self._client.call_tool(name, arguments)
             content = []
@@ -211,10 +265,14 @@ class MCPClient:
                     text = getattr(c, "text", None)
                     if text:
                         content.append(text)
+            self._log_wire("call_tool", name, {"tool": name, "arguments": arguments}, True,
+                           "\n".join(content), latency_ms=int((time.monotonic() - start) * 1000))
             return {
                 "success": True,
                 "content": content,
                 "is_error": getattr(result, "isError", False),
             }
         except Exception as e:
+            self._log_wire("call_tool", name, {"tool": name, "arguments": arguments}, False,
+                           error=str(e), latency_ms=int((time.monotonic() - start) * 1000))
             return {"success": False, "error": str(e), "content": [], "is_error": True}

@@ -162,6 +162,8 @@ class ScanResult:
     overall_risk_score: float
     risk_level: Severity
     active_testing_enabled: bool = False
+    # Verbatim MCP request/response log captured on the client during the scan.
+    wire_log: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         severity_counts = Counter(f.severity.value for f in self.findings)
@@ -186,4 +188,5 @@ class ScanResult:
             "findings": [f.to_dict() for f in self.findings],
             "tool_abuse_factors": [t.to_dict() for t in self.tool_abuse_factors],
             "attack_paths": [p.to_dict() for p in self.attack_paths],
+            "wire_log": self.wire_log,
         }

@@ -17,7 +17,7 @@ from rich.text import Text
 
 from .findings import Severity, ScanResult
 from .scanner import run_scan
-from .reporters import json_reporter, sarif_reporter, html_reporter
+from .reporters import json_reporter, sarif_reporter, html_reporter, bundle_reporter
 
 console = Console(stderr=False)
 
@@ -84,8 +84,8 @@ def main(ctx: click.Context) -> None:
 @click.option("--output", "-o", default=None,
               help="Base path for output files (e.g. results → results.json, results.html, results.sarif)")
 @click.option("--format", "-f", "fmt", default="all",
-              type=click.Choice(["json", "sarif", "html", "all"], case_sensitive=False),
-              help="Output format(s). Default: all.")
+              type=click.Choice(["json", "sarif", "html", "bundle", "all"], case_sensitive=False),
+              help="Output format(s). Default: all. 'bundle' = ATLAS-tagged Markdown report with verbatim wire log.")
 @click.option("--header", "-H", multiple=True,
               help="Custom HTTP header (Name: Value). Can be repeated.")
 @click.option("--rules", default=None,
@@ -169,6 +169,11 @@ def scan(
             html_reporter.write(result, p)
             paths_written.append(p)
 
+        if fmt in ("bundle", "all"):
+            p = f"{base}.md"
+            bundle_reporter.write(result, p)
+            paths_written.append(p)
+
         console.print()
         console.print(f"[bold]Reports written:[/] {', '.join(paths_written)}")
     else:
@@ -177,9 +182,10 @@ def scan(
         json_reporter.write(result, f"{stem}.json")
         html_reporter.write(result, f"{stem}.html")
         sarif_reporter.write(result, f"{stem}.sarif")
+        bundle_reporter.write(result, f"{stem}.md")
         console.print()
         console.print(
-            f"[dim]Reports:[/] {stem}.json, {stem}.html, {stem}.sarif"
+            f"[dim]Reports:[/] {stem}.json, {stem}.html, {stem}.sarif, {stem}.md"
         )
 
     # Exit with non-zero on critical/high
@@ -190,7 +196,7 @@ def scan(
 @main.command()
 @click.argument("target")
 @click.option("--ai-mode", default=None,
-              type=click.Choice(["openai", "ollama", "hybrid"], case_sensitive=False),
+              type=click.Choice(["openai", "ollama", "hybrid", "anthropic"], case_sensitive=False),
               help="Enable AI analysis (openai|ollama|hybrid).")
 @click.option("--ai-key", default=None, envvar="OPENAI_API_KEY",
               help="OpenAI-compatible API key (or set OPENAI_API_KEY env var).")
@@ -272,7 +278,7 @@ def interactive(
 @main.command()
 @click.argument("json_file")
 @click.option("--format", "-f", "fmt", default="html",
-              type=click.Choice(["json", "sarif", "html"], case_sensitive=False))
+              type=click.Choice(["json", "sarif", "html", "bundle"], case_sensitive=False))
 @click.option("--output", "-o", default=None)
 def report(json_file: str, fmt: str, output: str | None) -> None:
     """Re-generate a report from a saved JSON scan result.
@@ -281,12 +287,13 @@ def report(json_file: str, fmt: str, output: str | None) -> None:
     Examples:
       mcpray report results.json
       mcpray report results.json --format sarif --output ci_results.sarif
+      mcpray report results.json --format bundle    # ATLAS-tagged Markdown + wire log
     """
     data = json.loads(Path(json_file).read_text())
     # Reconstruct a minimal ScanResult-compatible dict for re-reporting
     console.print(f"[dim]Loaded: {json_file}[/]")
 
-    out = output or Path(json_file).stem + f".{fmt}"
+    out = output or Path(json_file).stem + (".md" if fmt == "bundle" else f".{fmt}")
     if fmt == "html":
         # We need a full ScanResult object — rebuild from dict
         result = _reconstruct_result(data)
@@ -294,6 +301,9 @@ def report(json_file: str, fmt: str, output: str | None) -> None:
     elif fmt == "sarif":
         result = _reconstruct_result(data)
         sarif_reporter.write(result, out)
+    elif fmt == "bundle":
+        result = _reconstruct_result(data)
+        bundle_reporter.write(result, out)
     else:
         # JSON is the source — just pretty-print it
         Path(out).write_text(json.dumps(data, indent=2))
@@ -1189,6 +1199,370 @@ def mitm(
             console.print(f"\n[green]✓[/] Session saved: {output}")
 
 
+# ─── preflight ────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.argument("target")
+@click.option("--header", "-H", multiple=True)
+@click.option("--timeout", default=30, show_default=True)
+def preflight(target, header, timeout):
+    """Report the negotiated MCP protocol + fastmcp/server versions."""
+    from .preflight import preflight as _pf
+    headers = {}
+    for h in header:
+        if ":" in h:
+            k, _, v = h.partition(":")
+            headers[k.strip()] = v.strip()
+    info = asyncio.run(_pf(target, headers, timeout))
+    body = (
+        f"[bold]Target:[/]    {info['target']}\n"
+        f"[bold]Reachable:[/] {info['reachable']}\n"
+        f"[bold]Transport:[/] {info.get('transport')}\n"
+        f"[bold]Protocol:[/]  {info.get('protocol_version')}\n"
+        f"[bold]Server:[/]    {info.get('server_name')} {info.get('server_version') or ''}\n"
+        f"[bold]fastmcp:[/]   {info.get('fastmcp_version')}"
+    )
+    if info.get("warning"):
+        body += f"\n[yellow]⚠ {info['warning']}[/]"
+    if info.get("error"):
+        body += f"\n[red]✗ {info['error']}[/]"
+    console.print(Panel(body, title="[bold cyan]mcpray — Preflight[/]", border_style="cyan", padding=(0, 2)))
+
+
+# ─── a2a (Module 4 — multi-agent / A2A) ─────────────────────────────────────────
+
+@main.group()
+def a2a() -> None:
+    """A2A / multi-agent attacks (Module 4)."""
+
+
+def _hdrs(header):
+    h = {}
+    for x in header:
+        if ":" in x:
+            k, _, v = x.partition(":")
+            h[k.strip()] = v.strip()
+    return h
+
+
+def _write_a2a(sr, output):
+    base = Path(output).stem if "." in Path(output).name else output
+    json_reporter.write(sr, f"{base}.json")
+    bundle_reporter.write(sr, f"{base}.md")
+    console.print(f"[green]✓[/] Reports: {base}.json, {base}.md")
+
+
+@a2a.command("discover")
+@click.argument("target")
+@click.option("--output", "-o", default=None)
+@click.option("--proxy", default=None)
+@click.option("--header", "-H", multiple=True)
+@click.option("--verbose", "-v", is_flag=True, default=False)
+def a2a_discover(target, output, proxy, header, verbose):
+    """Discover agent cards + OpenAPI endpoints, classify topology (4.1/4.2)."""
+    _configure_logging(verbose)
+    asyncio.run(_run_a2a_discover(target, output, proxy, _hdrs(header)))
+
+
+async def _run_a2a_discover(target, output, proxy, headers):
+    from .a2a.core import A2ASession, discover, classify, build_scan_result
+    from .findings import Finding, Severity
+
+    console.print(Panel(f"[bold]Target:[/] {target}", title="[bold green]mcpray — A2A Discovery[/]",
+                        border_style="green", padding=(0, 2)))
+    async with A2ASession(proxy=proxy, headers=headers) as session:
+        result = await discover(session, target)
+        c = classify(result)
+
+    console.print(f"[dim]reachable={result.reachable}  cards={len(result.cards)}  "
+                  f"registry_agents={len(result.registry_agents)}  endpoints={len(result.endpoints)}[/]")
+    for card in result.cards:
+        skills = [s.get("name") or s.get("id") for s in card.skills][:8]
+        console.print(Panel(f"[bold]{card.name}[/] v{card.version}\n{card.description[:160]}\n"
+                            f"url: {card.url}\nskills: {skills}",
+                            title=f"Agent Card ({card.source_url})", border_style="cyan"))
+    if result.registry_agents:
+        console.print("[bold]Registry agents:[/]")
+        for a in result.registry_agents:
+            console.print(f"  - {a['name']}  [dim]{a['url']}[/]")
+    if result.endpoints:
+        tbl = Table(box=box.SIMPLE, padding=(0, 1))
+        tbl.add_column("Method", width=7); tbl.add_column("Path"); tbl.add_column("Params")
+        for e in result.endpoints[:30]:
+            tbl.add_row(e.method, e.path, ", ".join(e.params))
+        console.print(tbl)
+    console.print(Panel(
+        f"system_type: [bold]{c['system_type']}[/]  ·  coordination: [bold]{c['coordination_pattern']}[/]  ·  "
+        f"framework: {c['framework']}\nsignals: {c['signals']}",
+        title="[bold]Topology (4.1.2 / 4.1.3)[/]", border_style="yellow"))
+    for n in result.notes:
+        console.print(f"[dim]• {n}[/]")
+
+    if output:
+        f = Finding(
+            id="A2A-DISC-001", title=f"A2A surface: {c['system_type']} / {c['coordination_pattern']}",
+            severity=Severity.INFORMATIONAL, affected_component=result.base_url,
+            evidence=(f"cards={[card.name for card in result.cards]} "
+                      f"agents={result.registry_agents} endpoints={[e.path for e in result.endpoints]} "
+                      f"framework={c['framework']}"),
+            reproduction_steps=["GET /.well-known/agent.json", "GET /openapi.json", "GET /agents"],
+            impact="Maps the multi-agent attack surface.", remediation="",
+            abuse_categories=[], risk_score=0.0, tags=["a2a", "discovery", "a2a-4.2"])
+        _write_a2a(build_scan_result(result.base_url, [f], result.wire_log), output)
+
+
+@a2a.command("rogue")
+@click.argument("registry_url")
+@click.option("--name", default="analytics-helper", show_default=True)
+@click.option("--url", "rurl", default="http://attacker.tld/a2a", show_default=True)
+@click.option("--output", "-o", default=None)
+@click.option("--proxy", default=None)
+@click.option("--unsafe", is_flag=True, default=False, help="Required — registers a real rogue agent.")
+def a2a_rogue(registry_url, name, rurl, output, proxy, unsafe):
+    """Register a rogue agent into an A2A registry (4.5)."""
+    if not unsafe:
+        console.print("[yellow]Registers a rogue agent on the target. Re-run with [bold]--unsafe[/] to confirm authorization.[/]")
+        return
+    asyncio.run(_run_a2a_rogue(registry_url, name, rurl, output, proxy))
+
+
+async def _run_a2a_rogue(registry_url, name, rurl, output, proxy):
+    from .a2a.core import A2ASession, build_scan_result
+    from .a2a.attacks import rogue_register
+    async with A2ASession(proxy=proxy) as session:
+        finding = await rogue_register(session, registry_url, name=name, url=rurl)
+        sr = build_scan_result(registry_url, [finding], session.wire_log)
+    console.print(Panel(f"[{_SEVERITY_STYLE.get(finding.severity.value, '')}]{finding.title}[/]\n{finding.evidence}",
+                        border_style="red"))
+    if output:
+        _write_a2a(sr, output)
+
+
+@a2a.command("spoof")
+@click.argument("target")
+@click.option("--attacker-url", required=True, help="Where the spoofed card will be hosted.")
+@click.option("--output", "-o", default=None)
+@click.option("--proxy", default=None)
+def a2a_spoof(target, attacker_url, output, proxy):
+    """Generate a spoofed agent card impersonating the target (4.6)."""
+    asyncio.run(_run_a2a_spoof(target, attacker_url, output, proxy))
+
+
+async def _run_a2a_spoof(target, attacker_url, output, proxy):
+    from .a2a.core import A2ASession, discover, build_scan_result
+    from .a2a.attacks import spoof_card, spoof_finding
+    async with A2ASession(proxy=proxy) as session:
+        result = await discover(session, target)
+        if not result.cards:
+            console.print("[yellow]No agent card found to spoof.[/]")
+            return
+        card = result.cards[0]
+        spoof = spoof_card(card, attacker_url)
+        finding = spoof_finding(card, attacker_url, spoof)
+        sr = build_scan_result(result.base_url, [finding], session.wire_log)
+    console.print_json(data=spoof)
+    console.print(Panel(finding.evidence, title=f"[bold]{finding.title}[/]", border_style="yellow"))
+    if output:
+        _write_a2a(sr, output)
+
+
+@a2a.command("poison")
+@click.option("--ingest-url", required=True)
+@click.option("--ingest-param", default="content", show_default=True)
+@click.option("--trigger-url", required=True)
+@click.option("--trigger-param", default="query", show_default=True)
+@click.option("--goal", default="")
+@click.option("--output", "-o", default=None)
+@click.option("--proxy", default=None)
+@click.option("--unsafe", is_flag=True, default=False, help="Required — plants a payload on the target.")
+def a2a_poison(ingest_url, ingest_param, trigger_url, trigger_param, goal, output, proxy, unsafe):
+    """Indirect PI via data poisoning in an A2A workflow (4.7)."""
+    if not unsafe:
+        console.print("[yellow]Plants a payload on the target. Re-run with [bold]--unsafe[/] to confirm authorization.[/]")
+        return
+    asyncio.run(_run_a2a_poison(ingest_url, ingest_param, trigger_url, trigger_param, goal, output, proxy))
+
+
+async def _run_a2a_poison(ingest_url, ingest_param, trigger_url, trigger_param, goal, output, proxy):
+    from .a2a.core import A2ASession, build_scan_result
+    from .a2a.attacks import data_poison
+    async with A2ASession(proxy=proxy) as session:
+        finding = await data_poison(session, ingest_url, ingest_param, trigger_url, trigger_param, goal)
+        sr = build_scan_result(ingest_url, [finding], session.wire_log)
+    console.print(Panel(f"[{_SEVERITY_STYLE.get(finding.severity.value, '')}]{finding.title}[/]\n{finding.evidence}",
+                        border_style="red"))
+    if output:
+        _write_a2a(sr, output)
+
+
+@a2a.command("attack")
+@click.argument("task_url")
+@click.option("--param", default="input", show_default=True)
+@click.option("--output", "-o", default=None)
+@click.option("--proxy", default=None)
+@click.option("--unsafe", is_flag=True, default=False, help="Required — sends attack payloads to the workflow.")
+def a2a_attack(task_url, param, output, proxy, unsafe):
+    """Workflow attacks: output manipulation + xp_cmdshell (4.4)."""
+    if not unsafe:
+        console.print("[yellow]Sends attack payloads to the workflow. Re-run with [bold]--unsafe[/] to confirm authorization.[/]")
+        return
+    asyncio.run(_run_a2a_attack(task_url, param, output, proxy))
+
+
+async def _run_a2a_attack(task_url, param, output, proxy):
+    from .a2a.core import A2ASession, build_scan_result
+    from .a2a.attacks import workflow_probe
+    async with A2ASession(proxy=proxy) as session:
+        findings = await workflow_probe(session, task_url, param)
+        sr = build_scan_result(task_url, findings, session.wire_log)
+    if not findings:
+        console.print("[green]✓ No workflow-integrity issues detected.[/]")
+        return
+    for f in findings:
+        console.print(Panel(f"[{_SEVERITY_STYLE.get(f.severity.value, '')}]{f.title}[/]\n{f.evidence}",
+                            border_style="red"))
+    if output:
+        _write_a2a(sr, output)
+
+
+# ─── tool-poison ──────────────────────────────────────────────────────────────
+
+@main.command("tool-poison")
+@click.argument("target")
+@click.option("--deep", is_flag=True, default=False, help="Also fetch and scan resource contents (7.2.2).")
+@click.option("--output", "-o", default=None, help="Base path for json + bundle report.")
+@click.option("--header", "-H", multiple=True)
+@click.option("--timeout", default=30, show_default=True)
+@click.option("--verbose", "-v", is_flag=True, default=False)
+def tool_poison(target, header, timeout, deep, output, verbose):
+    """Detect tool-description poisoning + MCP-Apps UI spoofing (Module 7.2)."""
+    _configure_logging(verbose)
+    headers = {}
+    for h in header:
+        if ":" in h:
+            k, _, v = h.partition(":")
+            headers[k.strip()] = v.strip()
+    asyncio.run(_run_tool_poison(target, headers, timeout, deep, output))
+
+
+async def _run_tool_poison(target, headers, timeout, deep, output):
+    from datetime import datetime, timezone
+    from .client import MCPClient
+    from .scanners.tool_poison import ToolPoisonScanner
+
+    console.print(Panel(f"[bold]Target:[/] {target}", title="[bold red]mcpray — Tool Poisoning[/]",
+                        border_style="red", padding=(0, 2)))
+    async with MCPClient(target, headers=headers, timeout=timeout) as client:
+        inventory = await client.get_inventory()
+        scanner = ToolPoisonScanner(client, {})
+        with console.status("[cyan]Analyzing tool/prompt metadata...[/]"):
+            await scanner.scan(inventory)
+            if deep:
+                for r in inventory.resources:
+                    uri = r.get("uri")
+                    if uri:
+                        content = await client.read_resource(uri)
+                        if content:
+                            scanner.scan_contents(r.get("name") or uri, f"Resource: {uri}", content)
+        findings = scanner.findings()
+        wire = list(client.wire_log)
+
+    if not findings:
+        console.print("[green]✓ No tool-poisoning or UI-spoofing indicators found.[/]")
+        return
+    tbl = Table(box=box.ROUNDED, padding=(0, 1))
+    tbl.add_column("ID", style="dim", width=12)
+    tbl.add_column("Severity", width=10)
+    tbl.add_column("Title")
+    for f in findings:
+        tbl.add_row(f.id, Text(f.severity.value, style=_SEVERITY_STYLE.get(f.severity.value, "")), f.title[:70])
+    console.print(tbl)
+    for f in findings[:8]:
+        console.print(Panel(f.evidence, title=f"[bold]{f.title}[/]", border_style="yellow", padding=(0, 1)))
+
+    if output:
+        result = _build_result(target, findings, inventory, wire)
+        base = Path(output).stem if "." in Path(output).name else output
+        json_reporter.write(result, f"{base}.json")
+        bundle_reporter.write(result, f"{base}.md")
+        console.print(f"[green]✓[/] Reports: {base}.json, {base}.md")
+
+
+def _build_result(target, findings, inventory, wire_log):
+    from datetime import datetime, timezone
+    sev_order = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, Severity.LOW: 3, Severity.INFORMATIONAL: 4}
+    top = min((f.severity for f in findings), key=lambda s: sev_order[s], default=Severity.INFORMATIONAL)
+    return ScanResult(
+        target=target, scan_timestamp=datetime.now(timezone.utc).isoformat(), scanner_version="1.0.0",
+        findings=findings, tool_abuse_factors=[], server_inventory=inventory, attack_paths=[],
+        overall_risk_score=max((f.risk_score for f in findings), default=0.0),
+        risk_level=top, active_testing_enabled=False, wire_log=wire_log,
+    )
+
+
+# ─── chain ────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.argument("target")
+@click.option("--steps", "steps_file", required=True,
+              help='JSON file: [{"tool": "run_cmd", "arguments": {"cmd": "id"}}, ...]')
+@click.option("--stop-on-fail", is_flag=True, default=False)
+@click.option("--output", "-o", default=None, help="Base path for json + bundle report.")
+@click.option("--header", "-H", multiple=True)
+@click.option("--timeout", default=30, show_default=True)
+@click.option("--unsafe", is_flag=True, default=False,
+              help="Required — chain executes REAL tool calls against the target.")
+@click.option("--verbose", "-v", is_flag=True, default=False)
+def chain(target, steps_file, stop_on_fail, output, header, timeout, unsafe, verbose):
+    """Execute a chain of MCP tool calls — automated 'chat → root' (Module 7.3)."""
+    _configure_logging(verbose)
+    steps = json.loads(Path(steps_file).read_text())
+    if not isinstance(steps, list) or not steps:
+        console.print("[red]--steps must be a non-empty JSON array of {tool, arguments}.[/]")
+        return
+    if not unsafe:
+        console.print(Panel(
+            "[bold yellow]chain executes REAL tool calls against the target.[/]\n"
+            "Re-run with [bold]--unsafe[/] to confirm you are authorized.",
+            title="WARNING", border_style="yellow"))
+        return
+    headers = {}
+    for h in header:
+        if ":" in h:
+            k, _, v = h.partition(":")
+            headers[k.strip()] = v.strip()
+    asyncio.run(_run_chain(target, steps, stop_on_fail, output, headers, timeout))
+
+
+async def _run_chain(target, steps, stop_on_fail, output, headers, timeout):
+    from .client import MCPClient
+    from .scanners.chain_exec import ChainExecutor
+
+    console.print(Panel(f"[bold]Target:[/] {target}\n[bold]Steps:[/] {len(steps)}",
+                        title="[bold red]mcpray — Tool Chain (chat → root)[/]",
+                        border_style="red", padding=(0, 2)))
+    async with MCPClient(target, headers=headers, timeout=timeout) as client:
+        executor = ChainExecutor(client)
+        with console.status("[cyan]Executing tool chain...[/]"):
+            executed = await executor.run(steps, stop_on_fail=stop_on_fail)
+        result = executor.to_scan_result(target)
+
+    for s in executed:
+        status = "[green]OK[/]" if s["success"] else f"[red]FAIL[/] ({s['error']})"
+        console.print(f"  [{s['step']}] {status} [bold]{s['tool']}[/] {s['arguments']}")
+        if s["output"]:
+            console.print(f"      [dim]{s['output'][:200]}[/]")
+
+    f = result.findings[0]
+    console.print(Panel(f"[{_SEVERITY_STYLE.get(f.severity.value, '')}]{f.title}[/]",
+                        border_style="red"))
+    if output:
+        base = Path(output).stem if "." in Path(output).name else output
+        json_reporter.write(result, f"{base}.json")
+        bundle_reporter.write(result, f"{base}.md")
+        console.print(f"[green]✓[/] Reports: {base}.json, {base}.md")
+
+
 # ─── nuclei ───────────────────────────────────────────────────────────────────
 
 @main.command()
@@ -1574,4 +1948,5 @@ def _reconstruct_result(data: dict) -> ScanResult:
         overall_risk_score=meta.get("overall_risk_score", 0.0),
         risk_level=Severity(meta.get("risk_level", "INFORMATIONAL")),
         active_testing_enabled=meta.get("active_testing_enabled", False),
+        wire_log=data.get("wire_log", []),
     )

@@ -63,6 +63,9 @@ async def run_scan(
             all_findings.extend(active_findings)
             logger.info("ACT scanner: %d findings", len(active_findings))
 
+        # Capture the verbatim MCP wire log for report evidence.
+        wire_log = list(client.wire_log)
+
     # Deduplicate findings by title + component
     all_findings = _deduplicate(all_findings)
 
@@ -90,6 +93,7 @@ async def run_scan(
         overall_risk_score=total_score,
         risk_level=risk_level,
         active_testing_enabled=active,
+        wire_log=wire_log,
     )
 
 
